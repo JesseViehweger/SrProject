@@ -1,3 +1,6 @@
+# plot this info in a csv
+# episode num, mandatory, optional, step count
+
 import gymnasium as gym
 import math
 import random
@@ -8,6 +11,8 @@ from collections import namedtuple, deque
 from itertools import count
 from PIL import Image
 
+from pathlib import Path
+import pickle
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -26,10 +31,21 @@ is_ipython = 'inline' in matplotlib.get_backend()
 if is_ipython:
     from IPython import display
 
-plt.ion()
+# plt.ion()
 
 # if gpu is to be used
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#get desired dropout
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--drop", help="amount of dropout to be used in the model", default=0
+)
+args = parser.parse_args()
+drop = args.drop
+drop = int(drop)
+
 
 ######################################################################
 # Replay Memory
@@ -72,7 +88,7 @@ class ReplayMemory(object):
 
 class DQN(nn.Module):
 
-    def __init__(self, h, w, outputs):
+    def __init__(self, h, w, outputs, drop):
         super(DQN, self).__init__()
         # from convolutional2d, change to linear layers followed by an activation(49 inputs 3 outputs, a few layers in the middle 49-20-3 etc) 
         #example
@@ -81,6 +97,9 @@ class DQN(nn.Module):
         self.layer2 = nn.Linear(20, 10)
         self.activation2 = nn.Tanh()
         self.layer3 = nn.Linear(10, 3)
+        self.dropout = nn.Dropout(p=(drop/100))
+
+
         # self.activation3 = nn.Tanh()
         
         # self.head = nn.Linear(3,1)
@@ -97,18 +116,20 @@ class DQN(nn.Module):
     # Called with either one element to determine next action, or a batch
     # during optimization. Returns tensor([[left0exp,right0exp]...]).
     def forward(self, x):
-        # x = x.to(device)
-        x = self.activation1(self.layer1(x.type(torch.float32)))
-        x = self.activation2(self.layer2(x))
+        
+        # x = self.activation1(self.layer1(x.type(torch.float32)))
+        # x = self.activation2(self.layer2(x))
+        # x = self.layer3(x)
+
+        x = self.activation1(self.dropout(self.layer1(x.type(torch.float32))))
+        x = self.activation2(self.dropout(self.layer2(x)))
         x = self.layer3(x)
-        # x = F.relu(self.bn1(self.conv1(x)))
-        # x = F.relu(self.bn2(self.conv2(x)))
-        # x = F.relu(self.bn3(self.conv3(x)))
+
         return x
 
 env.reset()
-plt.figure()
-plt.show()
+# plt.figure()
+# plt.show()
 
 ######################################################################
 # Training
@@ -146,10 +167,21 @@ TARGET_UPDATE = 10
 # _, _, screen_height, screen_width = init_screen.shape
 
 # Get number of actions from gym action space
-n_actions = env.action_space.n
 
-policy_net = DQN(8, 14, n_actions).to(device)
-target_net = DQN(8, 14, n_actions).to(device)
+# save networks for later running.
+n_actions = env.action_space.n
+#if pickle exists use it instead
+file = "test" + str(drop) + ".pkl"
+path = Path(file)
+
+if(path.is_file()):
+    infile = open(file,'rb')
+    policy_net = pickle.load(infile)
+    infile.close()
+    print("Reusing Trained Netowrk")
+
+policy_net = DQN(8, 14, n_actions, drop).to(device)
+target_net = DQN(8, 14, n_actions, drop).to(device)
 target_net.load_state_dict(policy_net.state_dict())
 target_net.eval()
 
@@ -171,9 +203,11 @@ def select_action(state):
             # t.max(1) will return largest column value of each row.
             # second column on max result is index of where max element was
             # found, so we pick action with the larger expected reward.
+            
             return policy_net(state).argmax()
     else:
-        return torch.tensor([[random.randrange(n_actions)]], device=device, dtype=torch.long)
+        #may need to change this to only sampe the actions we want to take in the environment
+        return torch.tensor([[random.randrange(0,3)]], device=device, dtype=torch.long)
 
 
 episode_durations = []
@@ -220,6 +254,9 @@ def optimize_model():
     if len(memory) < BATCH_SIZE:
         return
     transitions = memory.sample(BATCH_SIZE)
+
+    # print(transitions[0])
+
     # Transpose the batch (see https://stackoverflow.com/a/19343/3343043 for
     # detailed explanation). This converts batch-array of Transitions
     # to Transition of batch-arrays.
@@ -231,15 +268,34 @@ def optimize_model():
                                           batch.next_state)), device=device, dtype=torch.bool)
     non_final_next_states = torch.cat([s for s in batch.next_state
                                                 if s is not None])
-    print(type(batch.state))
+    
+    
     state_batch = torch.cat(batch.state)
+
+    
+
     action_batch = torch.cat(batch.action)
     reward_batch = torch.cat(batch.reward)
 
     # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
     # columns of actions taken. These are the actions which would've been taken
     # for each batch state according to policy_net
-    state_action_values = policy_net(state_batch).gather(1, action_batch)
+
+    #am i feeding this the wrong dimensioned/formatted. since the size of state_batch is is 
+    # 18816 and 18816/147 = 128 (147 is the first layers input size) is this batch size 128?
+    # print(state_batch.size())
+   
+    
+    state_batch = state_batch.reshape([BATCH_SIZE, 147])
+
+    # print(state_batch.size())
+
+    # print(action_batch.size())
+
+    #need a better explenation of why gather is being used here.
+
+    # state_action_values = policy_net(state_batch).gather(1, action_batch)
+    state_action_values = policy_net(state_batch).gather(0, action_batch)
 
     # Compute V(s_{t+1}) for all next states.
     # Expected values of actions for non_final_next_states are computed based
@@ -247,6 +303,11 @@ def optimize_model():
     # This is merged based on the mask, such that we'll have either the expected
     # state value or 0 in case the state was final.
     next_state_values = torch.zeros(BATCH_SIZE, device=device)
+
+    # print(non_final_next_states.size())
+    non_final_next_states = non_final_next_states.reshape([BATCH_SIZE, 147])
+
+
     next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0].detach()
     # Compute the expected Q values
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
@@ -275,8 +336,10 @@ def optimize_model():
 # the notebook and run lot more epsiodes, such as 300+ for meaningful
 # duration improvements.
 #
-
-num_episodes = 50
+i = 0
+num_episodes = 25
+blueNum = 0
+greenNum = 0
 for i_episode in range(num_episodes):
     # Initialize the environment and state
     env.reset()
@@ -284,21 +347,54 @@ for i_episode in range(num_episodes):
     state = env.gen_obs()
     image = state['image']
     image = image.flatten()
-    print(image)
+    # print(type(image))
+    #maybe i dont need below conversion
+    image = torch.from_numpy(image)
+
     state = image
 
+    # state = 
+    step = 0
+    done = False
 
-    for t in count():
+    #plot counts of obtaining each goal (green and blue) for a depressed vs healthy model.
+    #for t in count():
+    while done != True:
         # Select and perform an action
         action = select_action(state)
         obs, reward, done, _, _ = env.step(action.item())
+
+        step = step + 1
+        # print(step)
+        if (reward != 0):
+            # print(reward)
+            if((reward*100)%2 == 1):
+                print("green")
+                greenNum = greenNum + 1
+            else:
+                print("blue")
+                blueNum = blueNum + 1
+           
+
         reward = torch.tensor([reward], device=device)
+
+        test = torch.tensor([0], device=device)
+        
+        # if (reward != test):
+        #     print(step)
+        #     print(reward)
 
         # Observe new state
         obs = torch.tensor(obs['image'])
         obs = obs.flatten()
 
         # Store the transition in memory
+    
+
+        if(action.dim() == 0):
+            action = torch.tensor([[action]], device=device, dtype=torch.long)
+            action = action
+
         memory.push(state, action, obs, reward)
 
         # Move to the next state
@@ -307,18 +403,33 @@ for i_episode in range(num_episodes):
         # Perform one step of the optimization (on the policy network)
         optimize_model()
         if done:
-            episode_durations.append(t + 1)
-            plot_durations()
+            episode_durations.append(step + 1)
+            # plot_durations()
             break
     # Update the target network, copying all weights and biases in DQN
     if i_episode % TARGET_UPDATE == 0:
         target_net.load_state_dict(policy_net.state_dict())
 
+    print("Episode complete!")
+data = {'Optional':blueNum, 'Mandatory':greenNum}
+
+diffRewards = list(data.keys())
+values = list(data.values())
+  
+# creating the bar plot
+plt.bar(diffRewards, values, color ='maroon',
+        width = 0.4)
+plt.show()
+
+
+with open(file, 'wb') as f:
+    pickle.dump(policy_net, f)
+
 print('Complete')
 env.render()
 env.close()
-plt.ioff()
-plt.show()
+# plt.ioff()
+# plt.show()
 
 ######################################################################
 # Here is the diagram that illustrates the overall resulting data flow.
